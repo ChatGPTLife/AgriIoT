@@ -1,0 +1,33 @@
+# --- Environment / secrets ---
+.env
+.env.local
+*.pem
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+
+# --- AWS SAM ---
+.aws-sam/
+samconfig.local.toml
+packaged.yaml
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- Private notes (not pushed) ---
+fakereadme.md

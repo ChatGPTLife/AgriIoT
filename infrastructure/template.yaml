@@ -1,0 +1,593 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Agricultural IoT Environmental Monitoring System
+  API Gateway → Lambda → DynamoDB → SNS
+  Deploys all tables, functions, API routes, and the SNS alert topic.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  AppEnv:
+    Type: String
+    Default: prod
+    AllowedValues: [local, dev, staging, prod]
+    Description: Deployment environment label.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  SmtpUser:
+    Type: String
+    Default: ""
+    Description: Sender address for alert emails (e.g. yourname@gmail.com). Empty disables email.
+
+  SmtpAppPassword:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Google App Password for SmtpUser (16 characters, 2-Step Verification required).
+
+  OpenWeatherApiKey:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /agriiot/openweather_api_key
+    Description: SSM parameter name containing the OpenWeatherMap API key.
+    NoEcho: true
+
+  TomorrowIoApiKey:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /agriiot/tomorrowio_api_key
+    Description: SSM parameter name containing the Tomorrow.io API key.
+    NoEcho: true
+
+  WeatherProvider:
+    Type: String
+    Default: openweather
+    AllowedValues: [openweather, tomorrowio]
+    Description: Which weather provider to use.
+
+  AlertSmsPhoneNumbers:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated E.164 phone numbers for direct SMS alerts
+      (e.g. +15551234567,+15557654321). Leave blank to rely on SNS
+      topic subscribers only.
+
+  AlertCooldownMinutes:
+    Type: Number
+    Default: 360
+    Description: Minimum minutes between repeat alerts for the same zone.
+
+  CorsAllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Value for Access-Control-Allow-Origin header. Set to your
+      frontend origin in production (e.g. https://dashboard.example.com).
+
+  ForecastDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 16
+
+# ---------------------------------------------------------------------------
+# Globals – shared defaults applied to all Lambda functions
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    Handler: index.handler        # overridden per-function below
+    CodeUri: backend/
+    MemorySize: 256
+    Timeout: 30
+    Architectures: [arm64]
+    Layers: []
+    Environment:
+      Variables:
+        APP_ENV: !Ref AppEnv
+        LOG_LEVEL: !Ref LogLevel
+        AWS_ACCOUNT_ID: !Ref AWS::AccountId
+        ZONES_TABLE: !Ref ZonesTable
+        READINGS_TABLE: !Ref SensorReadingsTable
+        WEATHER_CACHE_TABLE: !Ref WeatherForecastCacheTable
+        ALERTS_TABLE: !Ref AlertsTable
+        IRRIGATION_DECISIONS_TABLE: !Ref IrrigationDecisionsTable
+        ACTIVITY_TABLE: !Ref ApiActivityTable
+        SUBSCRIBERS_TABLE: !Ref SubscribersTable
+        SMTP_USER: !Ref SmtpUser
+        SMTP_APP_PASSWORD: !Ref SmtpAppPassword
+        SNS_TOPIC_ARN: !Ref AlertsTopic
+        ALERT_SMS_PHONE_NUMBERS: !Ref AlertSmsPhoneNumbers
+        WEATHER_PROVIDER: !Ref WeatherProvider
+        OPENWEATHER_API_KEY: !Ref OpenWeatherApiKey
+        TOMORROWIO_API_KEY: !Ref TomorrowIoApiKey
+        FORECAST_DAYS: !Ref ForecastDays
+        ALERT_COOLDOWN_MINUTES: !Ref AlertCooldownMinutes
+        CORS_ALLOWED_ORIGIN: !Ref CorsAllowedOrigin
+
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,PATCH,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: !Sub "'${CorsAllowedOrigin}'"
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── API Gateway ───────────────────────────────────────────────────────────
+  AgriIotApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "AgriIot-Api-${AppEnv}"
+      StageName: !Ref AppEnv
+      Description: "Agricultural IoT REST API"
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: ERROR
+          MetricsEnabled: true
+
+  # ── SNS Alert Topic ───────────────────────────────────────────────────────
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "AgriIot-Alerts-${AppEnv}"
+      DisplayName: "Agricultural IoT Irrigation Alerts"
+      # SMS subscriptions are managed separately via the console / CLI because
+      # CloudFormation does not support the SMS protocol for SNS subscriptions.
+      # Add email subscribers here if needed:
+      # Subscription:
+      #   - Protocol: email
+      #     Endpoint: alerts@example.com
+
+  # ── DynamoDB Tables ───────────────────────────────────────────────────────
+
+  ZonesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AgriIot-Zones-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: zone_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: zone_id
+          KeyType: HASH
+
+  SensorReadingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AgriIot-SensorReadings-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: zone_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: zone_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  WeatherForecastCacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AgriIot-WeatherForecastCache-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: zone_id
+          AttributeType: S
+        - AttributeName: forecast_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: zone_id
+          KeyType: HASH
+        - AttributeName: forecast_date
+          KeyType: RANGE
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AgriIot-Alerts-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: alert_id
+          AttributeType: S
+        - AttributeName: zone_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ZoneIndex
+          KeySchema:
+            - AttributeName: zone_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  IrrigationDecisionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "AgriIot-IrrigationDecisions-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: zone_id
+          AttributeType: S
+        - AttributeName: evaluated_at
+          AttributeType: S
+        - AttributeName: record_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: zone_id
+          KeyType: HASH
+        - AttributeName: evaluated_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: AllDecisionsByTimeIndex
+          KeySchema:
+            - AttributeName: record_type
+              KeyType: HASH
+            - AttributeName: evaluated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ApiActivityTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "AgriIot-ApiActivity-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: stream
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: stream
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  SubscribersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "AgriIot-Subscribers-${AppEnv}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: subscriber_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: subscriber_id
+          KeyType: HASH
+
+  # ── IAM Role (shared by all Lambda functions) ─────────────────────────────
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AgriIot-LambdaRole-${AppEnv}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt ZonesTable.Arn
+                  - !GetAtt SensorReadingsTable.Arn
+                  - !GetAtt WeatherForecastCacheTable.Arn
+                  - !GetAtt AlertsTable.Arn
+                  - !GetAtt IrrigationDecisionsTable.Arn
+                  - !GetAtt ApiActivityTable.Arn
+                  - !GetAtt SubscribersTable.Arn
+                  - !Sub "${AlertsTable.Arn}/index/*"
+                  - !Sub "${IrrigationDecisionsTable.Arn}/index/*"
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref AlertsTopic
+                  - "*"   # allows direct SMS (PhoneNumber target, no resource ARN)
+
+  # ── Lambda Functions ───────────────────────────────────────────────────────
+
+  ZonesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-Zones-${AppEnv}"
+      Description: "Zones CRUD (POST/GET/PUT/DELETE /zones)"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        CreateZone:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones
+            Method: POST
+        ListZones:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones
+            Method: GET
+        GetZone:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}
+            Method: GET
+        UpdateZone:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}
+            Method: PUT
+        DeleteZone:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}
+            Method: DELETE
+      # Override the global handler per-route via a wrapper module.
+      # We use a single function for all zone routes and dispatch internally.
+      Handler: src.handlers.zones_router.handler
+
+  SensorIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-SensorIngest-${AppEnv}"
+      Description: "Sensor reading ingest (runs irrigation engine, triggers SNS alerts) and reading history"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.readings_router.handler
+      Timeout: 60   # extra time for SNS publish
+      Events:
+        IngestReading:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/readings
+            Method: POST
+        ListReadings:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/readings
+            Method: GET
+
+  NotificationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-Notifications-${AppEnv}"
+      Description: "Email alert subscribers and manual alert trigger (SMS + email)"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.notifications_router.handler
+      Timeout: 60   # SMTP delivery to several subscribers
+      Events:
+        CreateSubscriber:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /subscribers
+            Method: POST
+        ListSubscribers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /subscribers
+            Method: GET
+        DeleteSubscriber:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /subscribers/{subscriber_id}
+            Method: DELETE
+        TriggerAlert:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/alerts/trigger
+            Method: POST
+
+  SystemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-System-${AppEnv}"
+      Description: "Integration status and external API / SMS activity log"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.system_router.handler
+      Events:
+        GetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /system/status
+            Method: GET
+        ListActivity:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /system/activity
+            Method: GET
+
+  WeatherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-Weather-${AppEnv}"
+      Description: "Weather forecast cache read and on-demand refresh"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.weather_router.handler
+      Timeout: 30
+      Events:
+        GetWeather:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/weather
+            Method: GET
+        RefreshWeather:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/weather/refresh
+            Method: POST
+
+  AlertsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-Alerts-${AppEnv}"
+      Description: "Alerts list, get, and acknowledge"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.alerts_router.handler
+      Events:
+        ListAlerts:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /alerts
+            Method: GET
+        GetAlert:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /alerts/{alert_id}
+            Method: GET
+        AcknowledgeAlert:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /alerts/{alert_id}
+            Method: PATCH
+
+  IrrigationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-Irrigation-${AppEnv}"
+      Description: "Irrigation decision history"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.irrigation_router.handler
+      Events:
+        ListDecisions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /irrigation/decisions
+            Method: GET
+        GetLatestDecision:
+          Type: Api
+          Properties:
+            RestApiId: !Ref AgriIotApi
+            Path: /zones/{zone_id}/irrigation/latest
+            Method: GET
+
+  WeatherRefreshFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "AgriIot-WeatherRefresh-${AppEnv}"
+      Description: "Scheduled weather refresh for all enabled zones (every 6 hours)"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: src.handlers.weather.weather_refresh_scheduled
+      Timeout: 300   # 5 minutes max (many zones possible)
+      Events:
+        ScheduledRefresh:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(6 hours)"
+            Name: !Sub "AgriIot-WeatherRefresh-${AppEnv}"
+            Description: "Refresh weather forecasts for all enabled agricultural zones"
+            Enabled: true
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: "API Gateway base URL — set as VITE_API_BASE_URL in the frontend"
+    Value: !Sub "https://${AgriIotApi}.execute-api.${AWS::Region}.amazonaws.com/${AppEnv}"
+    Export:
+      Name: !Sub "AgriIot-ApiBaseUrl-${AppEnv}"
+
+  AlertsTopicArn:
+    Description: "SNS topic ARN for irrigation alerts"
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub "AgriIot-AlertsTopicArn-${AppEnv}"
+
+  ZonesTableName:
+    Value: !Ref ZonesTable
+
+  SensorReadingsTableName:
+    Value: !Ref SensorReadingsTable
+
+  WeatherCacheTableName:
+    Value: !Ref WeatherForecastCacheTable
+
+  AlertsTableName:
+    Value: !Ref AlertsTable
+
+  IrrigationDecisionsTableName:
+    Value: !Ref IrrigationDecisionsTable
