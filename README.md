@@ -211,3 +211,5 @@ Moisture thresholds are set per zone when it is created. Full list in [`.env.exa
 - [`docs/architecture.md`](docs/architecture.md) — Data flow diagrams
 - [`docs/database.md`](docs/database.md) — DynamoDB table schemas
 - [`docs/deployment.md`](docs/deployment.md) — Step-by-step deployment guide
+#   A g r i I T O  
+ 
